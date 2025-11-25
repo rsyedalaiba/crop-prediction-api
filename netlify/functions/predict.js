@@ -1,8 +1,11 @@
 const axios = require('axios');
 
 exports.handler = async (event) => {
+  console.log('🚀 Function started');
+  
   // CORS handling
   if (event.httpMethod === 'OPTIONS') {
+    console.log('🔧 CORS preflight');
     return {
       statusCode: 200,
       headers: {
@@ -15,15 +18,18 @@ exports.handler = async (event) => {
   }
 
   if (event.httpMethod !== 'POST') {
+    console.log('❌ Method not allowed:', event.httpMethod);
     return { statusCode: 405, body: 'Method Not Allowed' };
   }
 
   try {
     const body = JSON.parse(event.body);
-    console.log('Received data:', body);
+    console.log('📨 Received data:', JSON.stringify(body, null, 2));
     
-    // Submit prediction
-    const submitResponse = await axios.post(
+    // DIRECT APPROACH - No async polling
+    console.log('🔄 Calling Hugging Face API directly...');
+    
+    const response = await axios.post(
       'https://syedalaibarehman-integrate.hf.space/gradio_api/call/predict_fn',
       {
         data: [
@@ -43,31 +49,66 @@ exports.handler = async (event) => {
           parseFloat(body.soil_ph),
           parseFloat(body.ndvi)
         ]
+      },
+      { 
+        timeout: 8000, // 8 second timeout
+        headers: {
+          'Content-Type': 'application/json',
+          'User-Agent': 'Netlify-Function/1.0'
+        }
       }
     );
 
-    console.log('API Response:', submitResponse.data);
+    console.log('✅ API Response received:', JSON.stringify(response.data, null, 2));
 
-    const eventId = submitResponse.data.event_id;
-    console.log('Got event_id:', eventId);
-
-    // Use the CORRECT status endpoint
-    const result = await pollForResult(eventId);
-    
-    return {
-      statusCode: 200,
-      headers: {
-        'Access-Control-Allow-Origin': '*',
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({ 
-        success: true, 
-        prediction: result 
-      })
-    };
+    // If it returns event_id, that's fine - we'll return it
+    if (response.data.event_id) {
+      console.log('📝 Async response - event_id:', response.data.event_id);
+      
+      return {
+        statusCode: 200,
+        headers: {
+          'Access-Control-Allow-Origin': '*',
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ 
+          success: true, 
+          event_id: response.data.event_id,
+          message: 'Prediction submitted successfully. Use event_id to check status.',
+          note: 'This is a direct response from Hugging Face API'
+        })
+      };
+    } else {
+      // Direct prediction result
+      console.log('🎯 Direct prediction result');
+      
+      return {
+        statusCode: 200,
+        headers: {
+          'Access-Control-Allow-Origin': '*',
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ 
+          success: true, 
+          prediction: response.data,
+          source: 'direct-api'
+        })
+      };
+    }
     
   } catch (error) {
-    console.error('Final Error:', error.message);
+    console.error('❌ API Error:', {
+      message: error.message,
+      code: error.code,
+      status: error.response?.status,
+      data: error.response?.data,
+      config: {
+        url: error.config?.url,
+        method: error.config?.method
+      }
+    });
+
+    // Detailed error response
     return {
       statusCode: 500,
       headers: {
@@ -76,48 +117,12 @@ exports.handler = async (event) => {
       },
       body: JSON.stringify({ 
         success: false, 
-        error: error.message
+        error: error.message,
+        code: error.code,
+        status: error.response?.status,
+        response_data: error.response?.data,
+        note: 'Check Netlify function logs for detailed error information'
       })
     };
   }
 };
-
-// CORRECT polling function with right endpoint
-async function pollForResult(eventId, maxAttempts = 20) {
-  for (let attempt = 0; attempt < maxAttempts; attempt++) {
-    try {
-      // CORRECT STATUS ENDPOINT - This is the fix!
-      const statusResponse = await axios.get(
-        `https://syedalaibarehman-integrate.hf.space/gradio_api/queue/status?hash=${eventId}`
-      );
-      
-      const status = statusResponse.data;
-      console.log(`Polling attempt ${attempt + 1}:`, status.status);
-      
-      if (status.status === 'COMPLETED') {
-        console.log('Prediction completed:', status.data);
-        return status.data?.data?.[0];
-      } else if (status.status === 'FAILED') {
-        throw new Error('Prediction job failed');
-      } else if (status.status === 'PENDING') {
-        // Continue polling
-        await new Promise(resolve => setTimeout(resolve, 1500));
-        continue;
-      }
-      
-      // Wait before next poll
-      await new Promise(resolve => setTimeout(resolve, 1500));
-    } catch (error) {
-      console.error(`Polling error attempt ${attempt + 1}:`, error.message);
-      
-      // If it's the last attempt, throw the error
-      if (attempt === maxAttempts - 1) {
-        throw new Error(`Polling failed after ${maxAttempts} attempts: ${error.message}`);
-      }
-      
-      // Wait before retry
-      await new Promise(resolve => setTimeout(resolve, 1500));
-    }
-  }
-  throw new Error('Prediction timeout');
-}
